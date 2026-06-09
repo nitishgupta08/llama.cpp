@@ -1970,6 +1970,198 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     return data;
 }
 
+static common_chat_params common_chat_params_init_functiongemma(
+        const common_chat_template &          tmpl,
+        const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+
+    data.preserved_tokens = {
+        "<start_function_call>",
+        "<end_function_call>",
+        "<start_function_response>",
+        "<end_function_response>",
+        "<escape>",
+    };
+
+    data.additional_stops = {
+        "<end_function_call>",
+        "<start_function_response>",
+    };
+
+    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        // Anchor at the generation prompt so the parser starts at the right position.
+        auto gen_prompt = p.literal(data.generation_prompt);
+
+        // Capture any preamble the model emits before its first function call.
+        auto content = p.content(p.until("<start_function_call>"));
+
+        // Short-circuit: no tools or tool_choice=none → content-only parse.
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return gen_prompt + content + p.end();
+        }
+
+        auto tool_choice = p.choice();
+
+        LOG_INF("\n");
+        LOG_INF("========================================\n");
+        LOG_INF("FUNCTIONGEMMA PARSER INITIALIZATION\n");
+        LOG_INF("========================================\n");
+
+        LOG_INF("Prompt length            : %zu\n", data.prompt.size());
+        LOG_INF("Generation prompt length : %zu\n", data.generation_prompt.size());
+
+        LOG_INF("Generation prompt:\n");
+        LOG_INF("----BEGIN GEN PROMPT----\n%s\n----END GEN PROMPT----\n",
+                data.generation_prompt.c_str());
+
+        LOG_INF("Tools present            : %s\n",
+                has_tools ? "yes" : "no");
+
+        LOG_INF("Tool choice              : %d\n",
+                (int) inputs.tool_choice);
+
+        LOG_INF("Parallel tool calls      : %s\n",
+                inputs.parallel_tool_calls ? "true" : "false");
+
+        LOG_INF("JSON schema present      : %s\n",
+                inputs.json_schema.is_object() ? "true" : "false");
+
+        LOG_INF("Tool count               : %zu\n",
+                inputs.tools.is_array() ? inputs.tools.size() : 0);
+
+        if (inputs.tools.is_array()) {
+            for (size_t i = 0; i < inputs.tools.size(); ++i) {
+                const auto & tool = inputs.tools[i];
+
+                if (!tool.contains("function")) {
+                    continue;
+                }
+
+                const auto & function = tool.at("function");
+
+                LOG_INF("----------------------------------------\n");
+                LOG_INF("Tool[%zu] name: %s\n",
+                        i,
+                        function.value("name", "<missing>").c_str());
+
+                if (function.contains("parameters")) {
+                    LOG_INF("Schema:\n%s\n",
+                            function.at("parameters").dump(2).c_str());
+                }
+            }
+        }
+
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function  = tool.at("function");
+            const std::string name = function.at("name");
+
+            LOG_INF("Building parser for tool: %s\n", name.c_str());
+
+            const auto schema = function.contains("parameters")
+                ? function.at("parameters")
+                : json::object();
+            const auto & props =
+                (schema.contains("properties") && schema.at("properties").is_object())
+                ? schema.at("properties")
+                : json::object();
+
+            LOG_INF("Tool '%s' property count: %zu\n",
+                    name.c_str(),
+                    props.size());
+
+            // Build one alternative per declared argument.
+            auto arg_choice = p.choice();
+            for (const auto & [arg_name, arg_schema] : props.items()) {
+
+                LOG_INF(
+                    "Tool '%s' arg '%s' schema:\n%s\n",
+                    name.c_str(),
+                    arg_name.c_str(),
+                    arg_schema.dump(2).c_str());
+
+                const bool is_string =
+                    arg_schema.contains("type") && arg_schema.at("type") == "string";
+
+                LOG_INF(
+                    "Tool '%s' arg '%s' type=%s\n",
+                    name.c_str(),
+                    arg_name.c_str(),
+                    is_string ? "string" : "non-string");
+
+                // Strings: <escape>value<escape>
+                // Others: raw text terminated by , or }
+                auto arg_value = is_string
+                    ? p.literal("<escape>") +
+                      p.tool_arg_string_value(p.until("<escape>")) +
+                      p.literal("<escape>")
+                    : p.tool_arg_value(p.until_one_of({",", "}"}));
+
+                arg_choice |= p.rule(
+                    "tool-" + name + "-arg-" + arg_name,
+                    p.tool_arg(
+                        p.tool_arg_open(p.eps()) +
+                        p.tool_arg_name(p.literal(arg_name)) +
+                        p.literal(":") +
+                        arg_value +
+                        p.tool_arg_close(p.eps())));
+            }
+
+            // For tools with no declared properties, args must be empty: call:name{}
+            // For tools with properties, args are optional (model may omit some).
+            auto args = props.empty()
+                ? p.eps()
+                : p.optional(
+                    arg_choice +
+                    p.zero_or_more(p.literal(",") + p.space() + arg_choice));
+
+            // Full call syntax.
+            // <end_function_call> is optional: llama-server strips it when used as
+            // a stop string, so the parser must accept the call with or without it.
+            auto call = p.tool(
+                p.tool_open(
+                    p.literal("<start_function_call>call:") +
+                    p.tool_name(p.literal(name)) +
+                    p.literal("{")) +
+                p.tool_args(args) +
+                p.tool_close(
+                    p.literal("}") +
+                    p.optional(p.literal("<end_function_call>"))));
+
+            tool_choice |= p.rule("tool-" + name, call);
+        });
+
+        // max=1 unconditionally: the stop string already prevents a second call,
+        // so making max>1 here would only enable misparse of truncated output.
+        const int min_calls =
+            inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+        auto calls = p.repeat(tool_choice, min_calls, /* max = */ 1);
+
+        return gen_prompt +
+               content +
+               calls +
+               p.optional(p.literal("<end_of_turn>")) +
+               p.end();
+    });
+
+    data.parser = parser.save();
+
+    {
+        common_peg_arena arena;
+        arena.load(data.parser);
+
+        LOG_INF("FUNCTIONGEMMA GENERATED PARSER:\n%s\n",
+                arena.dump(arena.root()).c_str());
+    }
+
+    return data;
+}
+
 namespace workaround {
 
 static void map_developer_role_to_system(json & messages) {
@@ -2245,6 +2437,52 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("DSML") != std::string::npos) {
         LOG_DBG("Using specialized template: DeepSeek V3.2\n");
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
+    }
+
+    // FunctionGemma detection
+    if (src.find("<start_function_call>") != std::string::npos &&
+        src.find("<start_function_declaration>") != std::string::npos) {
+
+        LOG_INF("=== FUNCTIONGEMMA TEMPLATE DETECTED ===\n");
+        LOG_INF("Template length: %zu\n", src.size());
+        LOG_INF("Found marker: <start_function_call>\n");
+        LOG_INF("Found marker: <start_function_declaration>\n");
+
+        LOG_INF("generation params:\n");
+        LOG_INF("  tools present          : %s\n",
+                params.tools.is_array() && !params.tools.empty() ? "yes" : "no");
+        LOG_INF("  tool_choice            : %d\n", (int) params.tool_choice);
+        LOG_INF("  parallel_tool_calls    : %s\n",
+                params.parallel_tool_calls ? "true" : "false");
+        LOG_INF("  reasoning_format       : %d\n", (int) params.reasoning_format);
+        LOG_INF("  add_generation_prompt  : %s\n",
+                params.add_generation_prompt ? "true" : "false");
+
+        if (params.tools.is_array()) {
+            LOG_INF("Tool count: %zu\n", params.tools.size());
+
+            for (size_t i = 0; i < params.tools.size(); ++i) {
+                const auto & tool = params.tools[i];
+
+                if (tool.contains("function")) {
+                    const auto & fn = tool.at("function");
+
+                    LOG_INF("Tool[%zu]: %s\n",
+                            i,
+                            fn.value("name", "<missing>").c_str());
+
+                    if (fn.contains("parameters")) {
+                        LOG_INF("Tool[%zu] schema:\n%s\n",
+                                i,
+                                fn.at("parameters").dump(2).c_str());
+                    }
+                }
+            }
+        }
+
+        LOG_INF("Using specialized template: FunctionGemma\n");
+
+        return common_chat_params_init_functiongemma(tmpl, params);
     }
 
     // Gemma4 format detection
