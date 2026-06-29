@@ -758,6 +758,24 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
                            "{%- if false %}");
     }
 
+    auto patch_functiongemma = [](std::string & src) {
+        if (src.find("<start_function_call>") == std::string::npos ||
+            src.find("<start_function_declaration>") == std::string::npos ||
+            src.find("<escape>") == std::string::npos) {
+            return;
+        }
+        string_replace_all(src,
+            "{{ function['arguments'] }}",
+            "{%- set arguments = function['arguments'] | trim -%}"
+            "{%- if arguments.startswith('{') and arguments.endswith('}') -%}"
+            "{{- arguments[1:-1] | trim -}}"
+            "{%- else -%}"
+            "{{- arguments -}}"
+            "{%- endif -%}");
+    };
+    patch_functiongemma(default_template_src);
+    patch_functiongemma(template_tool_use_src);
+
     std::string token_bos = bos_token_override;
     std::string token_eos = eos_token_override;
     bool        add_bos   = false;
@@ -1426,6 +1444,118 @@ static common_chat_params common_chat_params_init_gemma4(const common_chat_templ
 
         data.grammar_triggers = {
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_call>" },
+        };
+    }
+
+    return data;
+}
+
+static common_chat_params common_chat_params_init_functiongemma(const common_chat_template &    tmpl,
+                                                                const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+
+    data.preserved_tokens = {
+        "<start_function_call>",
+        "<end_function_call>",
+        "<start_function_response>",
+        "<end_function_response>",
+        "<escape>",
+    };
+
+    data.additional_stops = {
+        "<end_function_call>",
+        "<start_function_response>",
+    };
+
+    auto has_tools       = inputs.tools.is_array() && !inputs.tools.empty();
+    auto include_grammar = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto gen_prompt = p.literal(data.generation_prompt);
+        auto content    = p.content(p.until("<start_function_call>"));
+
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return gen_prompt + content + p.end();
+        }
+
+        auto tool_choice = p.choice();
+
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            std::string  name     = function.at("name");
+            auto params   = function.contains("parameters") ? function.at("parameters") : json::object();
+            const auto & props =
+                (params.contains("properties") && params.at("properties").is_object())
+                    ? params.at("properties")
+                    : json::object();
+
+            auto arg_choice = p.choice();
+            for (const auto & [arg_name, arg_schema] : props.items()) {
+                const bool is_string =
+                    arg_schema.contains("type") && arg_schema.at("type") == "string";
+
+                auto arg_value = is_string
+                    ? p.literal("<escape>") +
+                      p.tool_arg_string_value(p.until("<escape>")) +
+                      p.literal("<escape>")
+                    : p.tool_arg_value(p.until_one_of({",", "}"}));
+
+                arg_choice |= p.rule(
+                    "tool-" + name + "-arg-" + arg_name,
+                    p.tool_arg(
+                        p.tool_arg_open(p.eps()) +
+                        p.tool_arg_name(p.literal(arg_name)) +
+                        p.literal(":") +
+                        arg_value +
+                        p.tool_arg_close(p.eps())));
+            }
+
+            auto args = props.empty()
+                ? p.eps()
+                : p.optional(arg_choice + p.zero_or_more(p.literal(",") + p.space() + arg_choice));
+
+            auto call = p.tool(
+                p.tool_open(
+                    p.literal("<start_function_call>call:") +
+                    p.tool_name(p.literal(name)) +
+                    p.literal("{")) +
+                p.tool_args(args) +
+                p.tool_close(
+                    p.literal("}") +
+                    p.optional(p.literal("<end_function_call>"))));
+
+            tool_choice |= p.rule("tool-" + name, call);
+        });
+
+        const int min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+        auto calls = p.repeat(tool_choice, min_calls, 1);
+
+        return gen_prompt +
+               content +
+               calls +
+               p.optional(p.literal("<end_of_turn>")) +
+               p.end();
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto schema = function.contains("parameters") ? function.at("parameters") : json::object();
+                builder.resolve_refs(schema);
+            });
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        data.grammar_triggers = {
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<start_function_call>" },
         };
     }
 
@@ -2604,6 +2734,12 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
     }
 
+    if (src.find("<start_function_call>") != std::string::npos &&
+        src.find("<start_function_declaration>") != std::string::npos &&
+        src.find("<escape>") != std::string::npos) {
+        return common_chat_params_init_functiongemma(tmpl, params);
+    }
+
     // Gemma4 format detection
     if (src.find("'<|tool_call>call:'") != std::string::npos) {
         if (src.find("{#- OpenAI Chat Completions:") == std::string::npos) {
@@ -2634,6 +2770,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
     const auto & src             = tmpl.source();
     const auto & caps            = tmpl.original_caps();
+    const bool is_functiongemma  = src.find("<start_function_call>") != std::string::npos &&
+                                   src.find("<start_function_declaration>") != std::string::npos &&
+                                   src.find("<escape>") != std::string::npos;
     params.messages              = render_message_to_json(inputs.messages, tmpl.original_caps());
     params.tool_choice           = inputs.tool_choice;
     params.reasoning_format      = inputs.reasoning_format;
@@ -2681,7 +2820,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::requires_non_null_content(params.messages);
     }
 
-    if (tmpl.original_caps().supports_object_arguments) {
+    if (tmpl.original_caps().supports_object_arguments && !is_functiongemma) {
         workaround::func_args_not_string(params.messages);
     }
 

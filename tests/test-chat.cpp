@@ -3154,6 +3154,106 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                     throw std::runtime_error("Gemma 4: generation prompt was modified despite add_generation_prompt=false");
                 }
             }
+
+        }
+    }
+
+    {
+        auto functiongemma_template = R"(
+{% macro format_argument(argument, escape_keys=True) -%}
+{%- if argument is string -%}
+    {{- '<escape>' + argument + '<escape>' -}}
+{%- elif argument is mapping -%}
+    {{- '{' -}}
+    {%- set ns = namespace(found_first=false) -%}
+    {%- for key, value in argument | dictsort -%}
+        {%- if ns.found_first %},{% endif -%}
+        {%- set ns.found_first = true -%}
+        {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
+    {%- endfor -%}
+    {{- '}' -}}
+{%- else -%}
+    {{- argument -}}
+{%- endif -%}
+{%- endmacro -%}
+{{ bos_token }}
+{%- if tools -%}
+{{- '<start_function_declaration><escape><end_function_declaration>' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- set role = "model" if message['role'] == 'assistant' else message['role'] -%}
+{{- '<start_of_turn>' + role + '\n' -}}
+{%- if 'tool_calls' in message and message['tool_calls'] -%}
+{%- for tool_call in message['tool_calls'] -%}
+{% set function = tool_call['function'] %}
+{{- '<start_function_call>call:' + function['name'] + '{' -}}
+{%- if function['arguments'] is mapping -%}
+{%- set ns = namespace(found_first=false) -%}
+{%- for key, value in function['arguments'] | dictsort -%}
+{%- if ns.found_first %},{% endif -%}
+{%- set ns.found_first = true -%}
+{{- key -}}:{{- format_argument(value, escape_keys=False) -}}
+{%- endfor -%}
+{%- elif function['arguments'] is string -%}
+                    {{ function['arguments'] }}
+{%- endif -%}
+{{- '}<end_function_call>' -}}
+{%- endfor -%}
+{%- elif message['content'] is string -%}
+{{- message['content'] -}}
+{%- endif -%}
+{{- '<end_of_turn>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<start_of_turn>model\n' -}}
+{%- endif -%}
+)";
+
+        auto tmpls = common_chat_templates_init(nullptr, functiongemma_template);
+
+        common_chat_tool weather_location_tool{
+            /* .name = */ "get_weather",
+            /* .description = */ "Get the current weather",
+            /* .parameters = */ R"({
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string"
+                    },
+                    "unit": {
+                        "type": "string"
+                    }
+                },
+                "required": ["location", "unit"]
+            })",
+        };
+
+        common_chat_msg msg_mapping = simple_assist_msg(
+            "", "", "get_weather", "{\"location\":\"New York\",\"unit\":\"celsius\"}");
+        common_chat_msg msg_string = simple_assist_msg(
+            "", "", "get_weather", "{location:'New York', unit: 'celsius'}");
+
+        {
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { message_user, msg_mapping, msg_string };
+            inputs.tools                 = { weather_location_tool };
+            inputs.add_generation_prompt = false;
+
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_contains(params.prompt, "<start_function_call>call:get_weather{location:'New York', unit: 'celsius'}<end_function_call>");
+        }
+
+        {
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { message_user };
+            inputs.tools                 = { weather_location_tool };
+            inputs.add_generation_prompt = true;
+
+            make_peg_parser parser(tmpls.get(), inputs);
+            auto msg = parser.parse(
+                "<start_function_call>call:get_weather{location:<escape>New York<escape>,unit:<escape>celsius<escape>}<end_function_call>",
+                false);
+            assert_equals(message_with_tool_calls("get_weather", R"({"location":"New York","unit":"celsius"})"), msg);
         }
     }
 
